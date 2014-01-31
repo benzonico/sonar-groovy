@@ -20,8 +20,16 @@
 
 package org.sonar.plugins.groovy;
 
-import org.sonar.api.config.Settings;
+import org.codehaus.groovy.antlr.parser.GroovyTokenTypes;
 
+import groovyjarjarantlr.Token;
+import groovyjarjarantlr.TokenStream;
+import groovyjarjarantlr.TokenStreamException;
+import net.sourceforge.pmd.cpd.SourceCode;
+import net.sourceforge.pmd.cpd.TokenEntry;
+import net.sourceforge.pmd.cpd.Tokens;
+import org.codehaus.groovy.antlr.parser.GroovyLexer;
+import org.sonar.api.config.Settings;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
 import org.gmetrics.GMetricsRunner;
@@ -47,6 +55,8 @@ import org.sonar.squid.measures.Metric;
 import org.sonar.squid.text.Source;
 
 import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileReader;
 import java.io.Reader;
 import java.io.StringReader;
 import java.util.Collection;
@@ -142,28 +152,78 @@ public class GroovySensor implements Sensor {
     ProjectFileSystem fileSystem = project.getFileSystem();
     Set<org.sonar.api.resources.Directory> packageList = new HashSet<org.sonar.api.resources.Directory>();
     for (File groovyFile : fileSystem.getSourceFiles(groovy)) {
+      org.sonar.api.resources.File resource = org.sonar.api.resources.File.fromIOFile(groovyFile, fileSystem.getSourceDirs());
+      double loc = 0;
+      double comments = 0;
+      int currentLine = 0;
       try {
-        reader = new StringReader(FileUtils.readFileToString(groovyFile, fileSystem.getSourceCharset().name()));
-        org.sonar.api.resources.File resource = org.sonar.api.resources.File.fromIOFile(groovyFile, fileSystem.getSourceDirs());
-        Source source = new Source(reader, new GroovyRecognizer());
-        packageList.add(new org.sonar.api.resources.Directory(resource.getParent().getKey()));
-        sensorContext.saveMeasure(resource, CoreMetrics.LINES, (double) source.getMeasure(Metric.LINES));
-        sensorContext.saveMeasure(resource, CoreMetrics.NCLOC, (double) source.getMeasure(Metric.LINES_OF_CODE));
-        double commentLinesMetric = (double) source.getMeasure(Metric.COMMENT_LINES);
-        if (settings.getBoolean(GroovyPlugin.IGNORE_HEADER_COMMENTS)) {
-          commentLinesMetric -= source.getMeasure(Metric.HEADER_COMMENT_LINES);
+        GroovyLexer groovyLexer = new GroovyLexer(new FileReader(groovyFile));
+        groovyLexer.setWhitespaceIncluded(true);
+        TokenStream tokenStream = groovyLexer.plumb();
+        Token token = tokenStream.nextToken();
+        Token previousToken = null;
+        while (token.getType() != Token.EOF_TYPE) {
+
+          if(previousToken!=null){
+            switch (previousToken.getType()) {
+              case GroovyTokenTypes.WS:
+              case GroovyTokenTypes.STRING_NL:
+              case GroovyTokenTypes.ONE_NL:
+              case GroovyTokenTypes.NLS:
+                break;
+              case GroovyTokenTypes.SL_COMMENT:
+              case GroovyTokenTypes.SH_COMMENT:
+              case GroovyTokenTypes.ML_COMMENT:
+                if(!(previousToken.getLine()==1 && settings.getBoolean(GroovyPlugin.IGNORE_HEADER_COMMENTS))){
+                  comments+=token.getLine()-previousToken.getLine()+1;
+                }
+                break;
+              default:
+                if(previousToken.getLine()!=currentLine){
+                  loc++;
+                  currentLine = previousToken.getLine();
+                }
+                break;
+            }
+          }
+          System.out.println("("+token.getLine()+","+token.getColumn()+")"+token.getType()+" :"+token.getText());
+          previousToken = token;
+          token = tokenStream.nextToken();
         }
-        sensorContext.saveMeasure(resource, CoreMetrics.COMMENT_LINES, commentLinesMetric);
-      } catch (Exception e) {
-        LOG.error("Can not analyze the file " + groovyFile.getAbsolutePath(), e);
-      } finally {
-        IOUtils.closeQuietly(reader);
+
+        switch (previousToken.getType()) {
+          case GroovyTokenTypes.WS:
+          case GroovyTokenTypes.STRING_NL:
+          case GroovyTokenTypes.ONE_NL:
+          case GroovyTokenTypes.NLS:
+            break;
+          case GroovyTokenTypes.ML_COMMENT:
+          case GroovyTokenTypes.SL_COMMENT:
+          case GroovyTokenTypes.SH_COMMENT:
+            comments+=token.getLine()-previousToken.getLine()+1;
+            break;
+          default:
+            if(previousToken.getLine()!=currentLine){
+              loc++;
+              currentLine = previousToken.getLine();
+            }
+            break;
+        }
+
+        sensorContext.saveMeasure(resource, CoreMetrics.LINES, (double) token.getLine());
+        sensorContext.saveMeasure(resource, CoreMetrics.NCLOC, loc);
+        sensorContext.saveMeasure(resource, CoreMetrics.COMMENT_LINES, comments);
+      } catch (TokenStreamException tse) {
+        LOG.error("Unexpected token when lexing file : " + groovyFile.getName(), tse);
+      } catch (FileNotFoundException fnfe) {
+        LOG.error("Could not find : " + groovyFile.getName(), fnfe);
       }
     }
     for (org.sonar.api.resources.Directory pack : packageList) {
       sensorContext.saveMeasure(pack, CoreMetrics.PACKAGES, 1.0);
     }
   }
+
 
   @Override
   public String toString() {
